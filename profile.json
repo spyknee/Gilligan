@@ -1,0 +1,82 @@
+{
+  "user": "spyknee",
+  "assistant_name": "Gilligan",
+  "style": {
+    "keep_responses_short": true,
+    "prefer_step_by_step": true,
+    "ask_clarifying_questions": true
+  },
+  "llm": {
+    "active_model": "qwen",
+    "models": {
+      "llama": {"base_url": "http://127.0.0.1:1234", "model": "meta-llama"},
+      "qwen": {"base_url": "http://127.0.0.1:1234", "model": "qwen/qwen3-coder-next"}
+    }
+  },
+  "web": {
+    "active_engine": "google",
+    "engines": {
+      "google": "https://www.google.com/search?q={q}",
+      "duckduckgo": "https://duckduckgo.com/?q={q}"
+    },
+    "browser": {
+      "use_opera_gx": true,
+      "opera_gx_path": "C:\\Users\\%USERNAME%\\AppData\\Local\\Programs\\Opera GX\\launcher.exe"
+    },
+    "crawl": {
+      "max_pages": 100,
+      "max_depth": 2,
+      "delay_seconds": 1.0,
+      "respect_robots": true,
+      "user_agent": "GilliganCrawler/1.0",
+      "max_bytes": 1000000,
+      "max_links_per_page": 200,
+      "timeout_seconds": 20
+    },
+    "auto_ingest_after_crawl": false
+  },
+  "run": {
+    "whitelist": ["dir", "type", "echo"]
+  },
+  "memory": {
+    "chunk_size": 900,
+    "chunk_overlap": 120,
+    "l0_summary_max_words": 120,
+    "depth_enabled": true,
+    "l1_summary_max_words": 200,
+    "l3_chunk_size": 300,
+    "l3_chunk_overlap": 60,
+    "auto_zoom_top_sources": 4,
+    "auto_l2_results_per_source": 1,
+    "fast_zoom_top_sources": 4,
+    "fast_l2_results_per_source": 0,
+    "deep_zoom_top_sources": 7,
+    "deep_l2_results_per_source": 2,
+    "cache_enabled": true,
+    "cache_ttl_seconds": 86400,
+    "cache_max_entries": 250,
+    "console_silence_http_logs": true,
+    "verify_summaries_with_details": true,
+    "verify_min_l2_per_source": 1,
+    "verify_use_l3_if_available": true,
+    "verify_max_distance": null,
+    "llm_max_tokens_answer": 900,
+    "llm_max_tokens_summary": 200,
+    "llm_max_tokens_verifier": 8,
+    "conversation_history_max_turns": 20,
+    "include_notes_md": true,
+    "auto_learn_enabled": true,
+    "auto_learn_min_evidence_chars": 60,
+    "auto_learn_require_user_approval": true,
+    "auto_learn_use_fact_verifier": true,
+    "auto_learn_requires_verified_sources": true,
+    "ingest_notes_only_approved": true,
+    "episodic_retention_days": 7,
+    "decay_rate_per_day": 0.05,
+    "prune_threshold": 0.2,
+    "consolidation_on_startup": true,
+    "episodic_top_k": 3,
+    "episodic_importance_boost": 0.1,
+    "episodic_default_importance": 0.5
+  }
+}
