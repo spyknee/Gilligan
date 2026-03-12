@@ -1147,10 +1147,15 @@ def cmd_ingest(path_str: str):
 
     files = []
     if path.is_dir():
+        seen = set()
         for ext in ["*.pdf", "*.docx", "*.txt", "*.md", "*.html", "*.htm", "*.rst", "*.csv"]:
-            files.extend(path.glob(ext))
-            files.extend(path.rglob(ext))
-        files = list(set(files))
+            for f in path.rglob(ext):
+                if any(p in f.parts for p in ('.venv', 'venv', 'env', '.virtualenv', '.env')):
+                    continue
+                resolved = f.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    files.append(f)
     else:
         files = [path]
 
