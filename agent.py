@@ -72,7 +72,7 @@ except ImportError:
     HAS_ROBOTS = False
 
 # ── Core constants ────────────────────────────────────────────────────────────
-AGENT_VERSION   = "v69-biomemory"
+AGENT_VERSION   = "v70-multimodel"
 ASSISTANT_NAME  = "Gilligan"
 BASE_DIR        = Path(os.environ.get("GILLIGAN_BASE_DIR", r"F:\ai-agent"))
 WAKE_WORDS      = ["gilligan"]
@@ -101,8 +101,24 @@ PROFILE_DEFAULTS = {
     "llm": {
         "active_model": "qwen",
         "models": {
-            "llama": {"base_url": "http://127.0.0.1:1234", "model": "meta-llama"},
-            "qwen":  {"base_url": "http://127.0.0.1:1234", "model": "qwen/qwen3-coder-next"},
+            "qwen": {
+                "base_url": "http://127.0.0.1:1234",
+                "model": "qwen/qwen3-coder-next",
+                "api_key": "lm-studio",
+                "provider": "lmstudio",
+            },
+            "qwen35": {
+                "base_url": "http://127.0.0.1:1234",
+                "model": "qwen/qwen3.5-9b",
+                "api_key": "lm-studio",
+                "provider": "lmstudio",
+            },
+            "model3": {
+                "base_url": "https://models.inference.ai.azure.com",
+                "model": "PLACEHOLDER",
+                "api_key_env": "GITHUB_TOKEN",
+                "provider": "github",
+            },
         },
     },
     "web": {
@@ -263,12 +279,24 @@ def get_active_model_cfg() -> dict:
 
 
 def build_llm_client() -> Optional[object]:
-    """Create and return an OpenAI client pointed at LM Studio."""
+    """Create and return an OpenAI client for the active model provider."""
     global _llm_client
     if not HAS_OPENAI:
         return None
     cfg = get_active_model_cfg()
-    _llm_client = OpenAI(base_url=cfg["base_url"] + "/v1", api_key="lm-studio")
+    provider = cfg.get("provider", "lmstudio")
+    base_url = cfg.get("base_url", "http://127.0.0.1:1234")
+
+    if provider == "github":
+        # GitHub inference endpoint — use base_url as-is, key from env
+        api_key_env = cfg.get("api_key_env", "GITHUB_TOKEN")
+        api_key = os.environ.get(api_key_env, "")
+        _llm_client = OpenAI(base_url=base_url, api_key=api_key)
+    else:
+        # LM Studio (and any other OpenAI-compatible local server) — append /v1
+        api_key = cfg.get("api_key", "lm-studio")
+        _llm_client = OpenAI(base_url=base_url + "/v1", api_key=api_key)
+
     return _llm_client
 
 
@@ -1748,6 +1776,13 @@ def startup():
 
     # 5. Build LLM client
     build_llm_client()
+
+    # Warn if github provider is active but its env var is unset
+    active_cfg = get_active_model_cfg()
+    if active_cfg.get("provider") == "github":
+        api_key_env = active_cfg.get("api_key_env", "GITHUB_TOKEN")
+        if not os.environ.get(api_key_env, ""):
+            print(f"[warn] active model uses provider=github but ${api_key_env} is not set — LLM calls will fail")
 
     # 6. Episodic decay
     pruned = 0
