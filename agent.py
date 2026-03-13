@@ -202,6 +202,7 @@ _llm_client: Optional[object] = None
 _working_memory: list = []          # list of {"role": ..., "content": ...}
 _query_cache: dict = {}             # {cache_key: (timestamp, answer)}
 _pending_facts: list = []           # auto-learn candidates awaiting approval
+MAX_PENDING_FACTS = 500
 _auto_learn_enabled: bool = True
 _web_enabled: bool = True
 _blocklist: list = []
@@ -377,7 +378,9 @@ def _now_ts() -> float:
 def _ts_from_iso(iso: str) -> float:
     try:
         dt = datetime.datetime.fromisoformat(iso)
-        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
     except Exception:
         return 0.0
 
@@ -656,7 +659,7 @@ def run_consolidation(client, model_cfg: dict, profile: dict) -> int:
                 fact = doc[:300]
 
             # Save to L2 as consolidated fact
-            fact_id = f"consolidated::{_sha(doc)}::{int(now)}"
+            fact_id = f"consolidated::{_sha(doc + doc_id)}"
             try:
                 c_l2.add(
                     documents=[fact],
@@ -804,7 +807,8 @@ def _summarise(text: str, instruction: str, max_tokens: int) -> str:
             temperature=0.3,
         )
         return resp.choices[0].message.content.strip()
-    except Exception:
+    except Exception as e:
+        print(f"[summarise] LLM error, falling back to raw text: {e}")
         return text[:500]
 
 
@@ -1088,6 +1092,7 @@ def crawl_site(start_url: str, profile: dict) -> dict:
 
         try:
             resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+            resp.raise_for_status()
             content = b""
             for chunk in resp.iter_content(chunk_size=8192):
                 content += chunk
@@ -1307,9 +1312,9 @@ def parse_keep_tags(text: str) -> list:
     Returns list of (tag, content) tuples.
     """
     patterns = [
-        (r"KEEP_STEPS:(.*?)(?=KEEP_|$)", "KEEP_STEPS"),
-        (r"KEEP_FACT:(.*?)(?=KEEP_|$)", "KEEP_FACT"),
-        (r"KEEP:(.*?)(?=KEEP_|$)", "KEEP"),
+        (r"KEEP_STEPS:(.*?)(?=KEEP_STEPS:|KEEP_FACT:|KEEP:|$)", "KEEP_STEPS"),
+        (r"KEEP_FACT:(.*?)(?=KEEP_STEPS:|KEEP_FACT:|KEEP:|$)", "KEEP_FACT"),
+        (r"KEEP(?!_STEPS|_FACT):(.*?)(?=KEEP_STEPS:|KEEP_FACT:|KEEP:|$)", "KEEP"),
     ]
     results = []
     for pattern, tag in patterns:
@@ -1351,6 +1356,8 @@ def auto_learn_check(question: str, answer: str, profile: dict):
     sentences = re.split(r"(?<=[.!?])\s+", answer)
     candidates = [s for s in sentences if len(s) > min_chars and not s.startswith("?")]
     for cand in candidates[:3]:
+        if len(_pending_facts) >= MAX_PENDING_FACTS:
+            _pending_facts.pop(0)
         _pending_facts.append({
             "question": question,
             "candidate": cand,
@@ -1446,7 +1453,10 @@ def build_system_prompt(query: str, mode: str = "auto") -> str:
     if mcfg("include_notes_md", True) and NOTES_FILE.exists():
         notes = notes_read()
         if notes.strip():
-            lines.append(f"\nNOTES:\n{notes[:1000]}")
+            notes_text = notes[:1000]
+            if len(notes) > 1000:
+                notes_text += "\n[... notes truncated ...]"
+            lines.append(f"\nNOTES:\n{notes_text}")
 
     return "\n".join(lines)
 
@@ -1743,6 +1753,7 @@ def cmd_run_whitelist_add(cmd_name: str):
     wl = _profile["run"]["whitelist"]
     if cmd_name not in wl:
         wl.append(cmd_name)
+        save_profile()
         print(f"[run] '{cmd_name}' added to whitelist")
     else:
         print(f"[run] '{cmd_name}' already in whitelist")
