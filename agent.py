@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  Gilligan  •  Agent v69-biomemory                           ║
+║  Gilligan  •  Agent v71-hardened                            ║
 ║  Bio-inspired persistent memory: episodic + semantic        ║
 ║  Decay · Consolidation · Pruning                            ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -13,6 +13,7 @@ import json
 import time
 import hashlib
 import re
+import shutil
 import subprocess
 import datetime
 import urllib.parse
@@ -72,7 +73,7 @@ except ImportError:
     HAS_ROBOTS = False
 
 # ── Core constants ────────────────────────────────────────────────────────────
-AGENT_VERSION   = "v70-multimodel"
+AGENT_VERSION   = "v71-hardened"
 ASSISTANT_NAME  = "Gilligan"
 BASE_DIR        = Path(os.environ.get("GILLIGAN_BASE_DIR", r"F:\ai-agent"))
 WAKE_WORDS      = ["gilligan"]
@@ -81,6 +82,8 @@ PROFILE_FILE    = BASE_DIR / "profile.json"
 NOTES_FILE      = BASE_DIR / "notes.md"
 BLOCKLIST_FILE  = BASE_DIR / "blocklist.txt"
 CHROMA_PATH     = BASE_DIR / "chroma_db"
+DECAY_STATE_FILE = BASE_DIR / "decay_last_run.json"
+MANIFEST_FILE   = BASE_DIR / "ingested_manifest.json"
 
 # ── Collection names ──────────────────────────────────────────────────────────
 COL_L0       = "mem_L0_overview"
@@ -378,6 +381,71 @@ def _ts_from_iso(iso: str) -> float:
         return 0.0
 
 
+def _should_run_decay() -> bool:
+    """Return True if 24+ hours have passed since decay last ran (or never ran)."""
+    if not DECAY_STATE_FILE.exists():
+        return True
+    try:
+        data = json.loads(DECAY_STATE_FILE.read_text(encoding="utf-8"))
+        last_run = float(data.get("last_run", 0))
+        return (time.time() - last_run) >= 86400.0
+    except Exception:
+        return True
+
+
+def _mark_decay_ran():
+    """Persist the current timestamp as the last decay run time."""
+    try:
+        DECAY_STATE_FILE.write_text(json.dumps({"last_run": time.time()}), encoding="utf-8")
+    except Exception as e:
+        print(f"[decay] could not save state: {e}")
+
+
+def _load_manifest() -> dict:
+    """Load the ingest manifest tracking {filepath: content_hash}."""
+    if MANIFEST_FILE.exists():
+        try:
+            return json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_manifest(manifest: dict):
+    """Persist the ingest manifest to disk."""
+    try:
+        MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ingest] manifest save error: {e}")
+
+
+def _file_content_hash(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's raw bytes."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _backup_chroma():
+    """Copy chroma_db/ to chroma_db_backup/ for safety."""
+    backup_path = BASE_DIR / "chroma_db_backup"
+    backup_tmp  = BASE_DIR / "chroma_db_backup_tmp"
+    if not CHROMA_PATH.exists():
+        return
+    try:
+        # Copy to a temp path first, then atomically replace the old backup
+        if backup_tmp.exists():
+            shutil.rmtree(backup_tmp)
+        shutil.copytree(str(CHROMA_PATH), str(backup_tmp))
+        if backup_path.exists():
+            shutil.rmtree(backup_path)
+        backup_tmp.rename(backup_path)
+        print(f"[backup] chroma_db backed up to chroma_db_backup/")
+    except Exception as e:
+        print(f"[backup] backup failed: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — Episodic Memory
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -596,10 +664,11 @@ def run_consolidation(client, model_cfg: dict, profile: dict) -> int:
                     documents=[fact],
                     ids=[fact_id],
                     metadatas=[{
-                        "source_type":  "consolidated_episode",
-                        "original_id":  doc_id,
-                        "timestamp":    _now_iso(),
-                        "source":       "episodic_consolidation",
+                        "source_type":   "consolidated_episode",
+                        "original_id":   doc_id,
+                        "original_text": doc[:2000],
+                        "timestamp":     _now_iso(),
+                        "source":        "episodic_consolidation",
                     }],
                 )
                 to_delete.append(doc_id)
@@ -634,29 +703,13 @@ def _chunk_text(text: str, size: int, overlap: int) -> list:
 
 
 def _safe_add(collection, documents: list, ids: list, metadatas: list):
-    """Add documents to a ChromaDB collection, skipping duplicate IDs."""
+    """Add documents to a ChromaDB collection using upsert (add or update)."""
     if not documents:
         return
     try:
-        # Get existing IDs to avoid duplicates
-        existing = set()
-        try:
-            res = collection.get(ids=ids)
-            existing = set(res.get("ids", []))
-        except Exception:
-            pass
-        new_docs  = []
-        new_ids   = []
-        new_metas = []
-        for d, i, m in zip(documents, ids, metadatas):
-            if i not in existing:
-                new_docs.append(d)
-                new_ids.append(i)
-                new_metas.append(m)
-        if new_docs:
-            collection.add(documents=new_docs, ids=new_ids, metadatas=new_metas)
+        collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
     except Exception as e:
-        print(f"[ingest] chroma add error: {e}")
+        print(f"[ingest] chroma upsert error: {e}")
 
 
 def ingest_text(text: str, source_name: str, profile: dict):
@@ -679,7 +732,7 @@ def ingest_text(text: str, source_name: str, profile: dict):
     l3_over  = int(mem.get("l3_chunk_overlap", 60))
     max_sum  = int(mem.get("llm_max_tokens_summary", 200))
 
-    source_id = _sha(source_name + text[:200])
+    source_id = _sha(source_name + text)
 
     # ── L2: standard chunks
     c_l2 = col(COL_L2)
@@ -924,9 +977,16 @@ def run_sandbox(command: str) -> str:
     if cmd_name not in [w.lower() for w in whitelist]:
         return f"[run] '{cmd_name}' is not in whitelist. Allowed: {whitelist}"
     try:
+        # Use cmd /c for Windows shell builtins (this agent targets Windows).
+        # On non-Windows systems these builtins won't apply and commands run directly.
+        shell_builtins = {"dir", "type", "echo", "cls", "copy", "move", "del", "ren", "md", "rd"}
+        if cmd_name in shell_builtins:
+            args = ["cmd", "/c"] + tokens
+        else:
+            args = tokens
         result = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=15,
@@ -1159,15 +1219,24 @@ def cmd_ingest(path_str: str):
     else:
         files = [path]
 
+    manifest = _load_manifest()
+    ingested_count = 0
     for f in files:
+        file_hash = _file_content_hash(f)
+        manifest_key = str(f.resolve())
+        if file_hash and manifest.get(manifest_key) == file_hash:
+            print(f"[ingest] skipping {f.name} (unchanged)")
+            continue
         print(f"[ingest] processing {f.name}…")
         text = extract_text(f)
         if text.strip():
             ingest_text(text, f.name, _profile)
+            manifest[manifest_key] = file_hash
+            ingested_count += 1
         else:
             print(f"[ingest] no text extracted from {f.name}")
-
-    print(f"[ingest] done — {len(files)} file(s)")
+    _save_manifest(manifest)
+    print(f"[ingest] done — {ingested_count} file(s) ingested, {len(files) - ingested_count} skipped")
 
 
 def cmd_rebuild():
@@ -1187,6 +1256,8 @@ def cmd_rebuild():
     for name in [COL_L0, COL_L1, COL_L2, COL_L3]:
         kwargs = {"embedding_function": _embed_fn} if _embed_fn else {}
         _collections[name] = _chroma_client.get_or_create_collection(name=name, **kwargs)
+    if MANIFEST_FILE.exists():
+        MANIFEST_FILE.unlink()
     print("[rebuild] semantic memory cleared and collections re-created")
 
 
@@ -1391,7 +1462,8 @@ def answer(question: str, mode: str = "auto") -> str:
         return block
 
     # Cache
-    cache_key = _sha(question + mode)
+    active_model = pcfg("llm.active_model", "default")
+    cache_key = _sha(question + mode + active_model)
     cached = cache_lookup(cache_key)
     if cached:
         return f"[cached] {cached}"
@@ -1488,6 +1560,7 @@ def print_help():
 ║
 ║  DIAGNOSTICS
 ║    /doctor                System health check
+║    /backup                Manual ChromaDB backup
 ║    /mega_torture          Memory stress test
 ║    /depth_test            Depth retrieval test
 ║    /help                  Show this help
@@ -1501,6 +1574,8 @@ def cmd_doctor():
     """Print system health status."""
     ep_status = episodic_status()
     model_cfg = get_active_model_cfg()
+    backup_path = BASE_DIR / "chroma_db_backup"
+    backup_status = "present" if backup_path.exists() else "missing"
 
     print(f"""
 [doctor] ── {ASSISTANT_NAME} {AGENT_VERSION} ──────────────────────────
@@ -1508,6 +1583,7 @@ def cmd_doctor():
   Profile:           {Path(__file__).parent / 'profile.json'}
   Notes:             {NOTES_FILE}
   ChromaDB:          {CHROMA_PATH}
+  ChromaDB backup:   {backup_path} [{backup_status}]
 
   LLM:
     Active model:    {pcfg('llm.active_model', 'n/a')}
@@ -1560,6 +1636,11 @@ def cmd_consolidate():
     model_cfg = get_active_model_cfg()
     n = run_consolidation(_llm_client, model_cfg, _profile)
     print(f"[consolidate] {n} episode(s) consolidated into semantic memory")
+
+
+def cmd_backup():
+    """Manually trigger a ChromaDB backup."""
+    _backup_chroma()
 
 
 def cmd_memory_status():
@@ -1778,6 +1859,7 @@ def startup():
 
     # 4. Init ChromaDB
     init_chroma()
+    _backup_chroma()
 
     # 5. Build LLM client
     build_llm_client()
@@ -1791,8 +1873,9 @@ def startup():
 
     # 6. Episodic decay
     pruned = 0
-    if HAS_CHROMA:
+    if HAS_CHROMA and _should_run_decay():
         pruned = run_episodic_decay(_profile)
+        _mark_decay_ran()
 
     # 7. Consolidation
     consolidated = 0
@@ -1827,6 +1910,8 @@ def dispatch_command(raw: str) -> bool:
         return False
     elif cmd == "/doctor":
         cmd_doctor()
+    elif cmd == "/backup":
+        cmd_backup()
     elif cmd == "/ingest":
         if arg1:
             cmd_ingest(arg1)
