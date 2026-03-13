@@ -305,5 +305,235 @@ class TestDeepMerge(unittest.TestCase):
         self.assertIsNot(result, base)
 
 
+# ===========================================================================
+# 7. _ts_from_iso — timezone handling
+# ===========================================================================
+class TestTsFromIso(unittest.TestCase):
+    def test_utc_iso_parses_correctly(self):
+        # 2024-01-01T00:00:00+00:00 → unix timestamp 1704067200
+        result = agent._ts_from_iso("2024-01-01T00:00:00+00:00")
+        self.assertAlmostEqual(result, 1704067200.0, places=0)
+
+    def test_naive_iso_treated_as_utc(self):
+        # Naive string (no tz) must not crash and must return a float
+        result = agent._ts_from_iso("2024-01-01T00:00:00")
+        self.assertIsInstance(result, float)
+        self.assertGreater(result, 0)
+
+    def test_zulu_suffix_parses(self):
+        result = agent._ts_from_iso("2024-01-01T00:00:00Z")
+        self.assertAlmostEqual(result, 1704067200.0, places=0)
+
+    def test_invalid_string_returns_zero(self):
+        result = agent._ts_from_iso("not-a-date")
+        self.assertEqual(result, 0.0)
+
+    def test_empty_string_returns_zero(self):
+        result = agent._ts_from_iso("")
+        self.assertEqual(result, 0.0)
+
+    def test_offset_aware_matches_utc(self):
+        # +01:00 offset — same instant as UTC minus 1 hour
+        result_utc = agent._ts_from_iso("2024-06-01T12:00:00+00:00")
+        result_offset = agent._ts_from_iso("2024-06-01T13:00:00+01:00")
+        self.assertAlmostEqual(result_utc, result_offset, places=0)
+
+
+# ===========================================================================
+# 8. parse_keep_tags — no double-match regression
+# ===========================================================================
+class TestParseKeepTags(unittest.TestCase):
+    def test_basic_keep_tag_extracted(self):
+        text = "Hello [KEEP: remember this fact]"
+        tags = agent.parse_keep_tags(text)
+        self.assertEqual(len(tags), 1)
+        # parse_keep_tags returns (tag, content) tuples
+        self.assertIn("remember this fact", tags[0][1])
+
+    def test_keep_steps_not_matched_as_keep(self):
+        # [KEEP_STEPS: ...] must NOT be returned as a plain KEEP tag
+        text = "[KEEP_STEPS: do step one then step two]"
+        tags = agent.parse_keep_tags(text)
+        plain_keeps = [t for t in tags if "STEPS" not in t[0].upper()]
+        self.assertEqual(plain_keeps, [])
+
+    def test_keep_fact_not_matched_as_keep(self):
+        text = "[KEEP_FACT: the sky is blue]"
+        tags = agent.parse_keep_tags(text)
+        plain_keeps = [t for t in tags if "FACT" not in t[0].upper()]
+        self.assertEqual(plain_keeps, [])
+
+    def test_multiple_keep_tags_all_returned(self):
+        text = "[KEEP: alpha] some text [KEEP: beta]"
+        tags = agent.parse_keep_tags(text)
+        self.assertEqual(len(tags), 2)
+
+    def test_no_tags_returns_empty(self):
+        self.assertEqual(agent.parse_keep_tags("no tags here"), [])
+
+
+# ===========================================================================
+# 9. run_consolidation — max_per_run cap
+# ===========================================================================
+class TestRunConsolidationCap(unittest.TestCase):
+    def _make_episode(self, doc_id: str, days_ago: float) -> tuple:
+        import datetime as dt
+        ts = time.time() - days_ago * 86400
+        iso = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat()
+        doc = f"Episode content for {doc_id}"
+        meta = {"timestamp": iso, "source_type": "episodic"}
+        return doc_id, doc, meta
+
+    def test_consolidation_respects_max_per_run(self):
+        # Build 10 old episodes (all beyond retention window)
+        episodes = [self._make_episode(f"ep::{i}", days_ago=10) for i in range(10)]
+        ids   = [e[0] for e in episodes]
+        docs  = [e[1] for e in episodes]
+        metas = [e[2] for e in episodes]
+
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ids, "documents": docs, "metadatas": metas}
+
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "summary"
+        mock_client.chat.completions.create.return_value = mock_resp
+
+        profile = {
+            "memory": {
+                "episodic_retention_days": 7,
+                "llm_max_tokens_summary": 200,
+                "max_consolidate_per_run": 3,
+            }
+        }
+        model_cfg = {"model": "test-model"}
+
+        with patch("agent.col", return_value=mock_col):
+            count = agent.run_consolidation(mock_client, model_cfg, profile)
+
+        self.assertLessEqual(count, 3)
+
+    def test_consolidation_zero_cap_consolidates_nothing(self):
+        episodes = [self._make_episode(f"ep::{i}", days_ago=10) for i in range(5)]
+        ids   = [e[0] for e in episodes]
+        docs  = [e[1] for e in episodes]
+        metas = [e[2] for e in episodes]
+
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ids, "documents": docs, "metadatas": metas}
+
+        profile = {
+            "memory": {
+                "episodic_retention_days": 7,
+                "llm_max_tokens_summary": 200,
+                "max_consolidate_per_run": 0,
+            }
+        }
+        model_cfg = {"model": "test-model"}
+        mock_client = MagicMock()
+
+        with patch("agent.col", return_value=mock_col):
+            count = agent.run_consolidation(mock_client, model_cfg, profile)
+
+        self.assertEqual(count, 0)
+
+
+# ===========================================================================
+# 10. build_context_block — chunk/char limits
+# ===========================================================================
+class TestBuildContextBlock(unittest.TestCase):
+    def _profile_with(self, max_chunks: int, chunk_chars: int):
+        return {
+            "memory": {
+                "context_max_chunks": max_chunks,
+                "context_chunk_max_chars": chunk_chars,
+                "cache_enabled": False,
+            }
+        }
+
+    def test_returns_empty_when_no_chunks(self):
+        with patch("agent.retrieve_semantic", return_value=[]), \
+             patch.object(agent, "_profile", self._profile_with(5, 300)):
+            result = agent.build_context_block("query")
+        self.assertEqual(result, "")
+
+    def test_chunk_count_capped(self):
+        chunks = [f"chunk {i} " * 20 for i in range(10)]
+        with patch("agent.retrieve_semantic", return_value=chunks), \
+             patch.object(agent, "_profile", self._profile_with(3, 500)):
+            result = agent.build_context_block("query")
+        # Should have exactly 3 [M-N] markers
+        self.assertEqual(result.count("[M-"), 3)
+
+    def test_chunk_chars_truncated(self):
+        chunks = ["x" * 1000]
+        with patch("agent.retrieve_semantic", return_value=chunks), \
+             patch.object(agent, "_profile", self._profile_with(5, 50)):
+            result = agent.build_context_block("query")
+        # The chunk content in the result must be at most 50 chars
+        line = [l for l in result.splitlines() if l.startswith("[M-1]")][0]
+        content = line[len("[M-1] "):]
+        self.assertLessEqual(len(content), 50)
+
+    def test_header_present(self):
+        chunks = ["some memory content"]
+        with patch("agent.retrieve_semantic", return_value=chunks), \
+             patch.object(agent, "_profile", self._profile_with(5, 300)):
+            result = agent.build_context_block("query")
+        self.assertIn("MEMORY CONTEXT", result)
+
+
+# ===========================================================================
+# 11. llm_chat — streaming
+# ===========================================================================
+class TestLlmChatStreaming(unittest.TestCase):
+    def _make_chunk(self, content):
+        chunk = MagicMock()
+        chunk.choices[0].delta.content = content
+        return chunk
+
+    def test_streaming_assembles_full_response(self):
+        chunks = [self._make_chunk(c) for c in ["Hello", ", ", "world", "!"]]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+
+        with patch.object(agent, "_llm_client", mock_client), \
+             patch.object(agent, "HAS_OPENAI", True), \
+             patch.object(agent, "get_active_model_cfg", return_value={"model": "test"}):
+            result = agent.llm_chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result, "Hello, world!")
+
+    def test_streaming_skips_none_deltas(self):
+        chunks = [self._make_chunk("A"), self._make_chunk(None), self._make_chunk("B")]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+
+        with patch.object(agent, "_llm_client", mock_client), \
+             patch.object(agent, "HAS_OPENAI", True), \
+             patch.object(agent, "get_active_model_cfg", return_value={"model": "test"}):
+            result = agent.llm_chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result, "AB")
+
+    def test_llm_unavailable_returns_error_string(self):
+        with patch.object(agent, "HAS_OPENAI", False):
+            result = agent.llm_chat([])
+        self.assertIn("unavailable", result.lower())
+
+    def test_exception_returns_error_string(self):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = Exception("boom")
+
+        with patch.object(agent, "_llm_client", mock_client), \
+             patch.object(agent, "HAS_OPENAI", True), \
+             patch.object(agent, "get_active_model_cfg", return_value={"model": "test"}):
+            result = agent.llm_chat([])
+
+        self.assertIn("error", result.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
