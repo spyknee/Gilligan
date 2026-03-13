@@ -584,8 +584,8 @@ def run_episodic_decay(profile: dict) -> int:
                 to_update_ids.append(doc_id)
                 to_update_meta.append({
                     **meta,
-                    "importance":    str(new_importance),
-                    "last_accessed": iso_now,
+                    "importance": str(new_importance),
+                    # Do NOT touch last_accessed here — only update importance
                 })
 
         if to_delete:
