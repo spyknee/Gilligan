@@ -18,6 +18,7 @@ import subprocess
 import datetime
 import urllib.parse
 import threading
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -482,10 +483,7 @@ def episodic_retrieve(query: str) -> list:
         return []
     k = int(mcfg("episodic_top_k", 3))
     try:
-        count = c.count()
-        if count == 0:
-            return []
-        results = c.query(query_texts=[query], n_results=min(k, count))
+        results = c.query(query_texts=[query], n_results=k)
         docs = results.get("documents", [[]])[0]
         ids  = results.get("ids", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
@@ -493,17 +491,20 @@ def episodic_retrieve(query: str) -> list:
         # Boost importance + update last_accessed for retrieved entries
         boost = float(mcfg("episodic_importance_boost", 0.1))
         iso_now = _now_iso()
+        batch_ids = []
+        batch_metas = []
         for doc_id, meta in zip(ids, metas):
-            imp = float(meta.get("importance", 0.5))
-            imp = min(1.0, imp + boost)
-            c.update(ids=[doc_id], metadatas=[{
-                **meta,
-                "importance":    str(imp),
-                "last_accessed": iso_now,
-            }])
+            imp = min(1.0, float(meta.get("importance", 0.5)) + boost)
+            batch_ids.append(doc_id)
+            batch_metas.append({**meta, "importance": str(imp), "last_accessed": iso_now})
+        if batch_ids:
+            c.update(ids=batch_ids, metadatas=batch_metas)
 
         return docs
     except Exception as e:
+        err = str(e)
+        if "empty" in err.lower() or "fewer" in err.lower() or "number of requested" in err.lower():
+            return []
         print(f"[episodic] retrieve error: {e}")
         return []
 
@@ -561,9 +562,6 @@ def run_episodic_decay(profile: dict) -> int:
     pruned      = 0
 
     try:
-        count = c.count()
-        if count == 0:
-            return 0
         results = c.get(include=["metadatas", "documents"])
         ids    = results.get("ids", [])
         metas  = results.get("metadatas", [])
@@ -592,8 +590,8 @@ def run_episodic_decay(profile: dict) -> int:
 
         if to_delete:
             c.delete(ids=to_delete)
-        for uid, umeta in zip(to_update_ids, to_update_meta):
-            c.update(ids=[uid], metadatas=[umeta])
+        if to_update_ids:
+            c.update(ids=to_update_ids, metadatas=to_update_meta)
 
     except Exception as e:
         print(f"[decay] error: {e}")
@@ -767,16 +765,25 @@ def ingest_text(text: str, source_name: str, profile: dict):
             [{"source": source_name, "layer": "L0"}],
         )
 
-    # ── L1: mid-level chunk summaries
+    # ── L1: mid-level chunk summaries (parallelised)
     c_l1 = col(COL_L1)
     if c_l1:
         large_chunks = _chunk_text(text, c_size * 3, c_over * 3)
-        docs1, ids1, metas1 = [], [], []
-        for i, chunk in enumerate(large_chunks):
-            s = _summarise(chunk[:4000], f"Summarise in up to {l1_words} words.", max_sum)
-            docs1.append(s)
-            ids1.append(f"l1::{source_id}::{i}")
-            metas1.append({"source": source_name, "chunk_index": str(i), "layer": "L1"})
+        chunk_summaries: dict = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futs = {
+                executor.submit(_summarise, chunk[:4000], f"Summarise in up to {l1_words} words.", max_sum): i
+                for i, chunk in enumerate(large_chunks)
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                i = futs[fut]
+                try:
+                    chunk_summaries[i] = fut.result()
+                except Exception:
+                    chunk_summaries[i] = large_chunks[i][:500]
+        docs1  = [chunk_summaries[i] for i in range(len(large_chunks))]
+        ids1   = [f"l1::{source_id}::{i}" for i in range(len(large_chunks))]
+        metas1 = [{"source": source_name, "chunk_index": str(i), "layer": "L1"} for i in range(len(large_chunks))]
         _safe_add(c_l1, docs1, ids1, metas1)
 
     print(f"[ingest] {source_name} → L0/L1/L2/L3 done")
@@ -811,14 +818,14 @@ def _query_col(collection_name: str, query: str, n: int) -> list:
     if c is None:
         return []
     try:
-        count = c.count()
-        if count == 0:
-            return []
-        results = c.query(query_texts=[query], n_results=min(n, count))
+        results = c.query(query_texts=[query], n_results=n)
         docs   = results.get("documents", [[]])[0]
         metas  = results.get("metadatas", [[]])[0]
         return list(zip(docs, metas))
     except Exception as e:
+        err = str(e)
+        if "empty" in err.lower() or "fewer" in err.lower() or "number of requested" in err.lower():
+            return []
         print(f"[query] {collection_name} error: {e}")
         return []
 
