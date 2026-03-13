@@ -187,9 +187,12 @@ PROFILE_DEFAULTS = {
         "decay_rate_per_day": 0.05,
         "prune_threshold": 0.2,
         "consolidation_on_startup": True,
-        "episodic_top_k": 3,
+        "max_consolidate_per_run": 5,
+        "episodic_top_k": 2,
         "episodic_importance_boost": 0.1,
         "episodic_default_importance": 0.5,
+        "context_max_chunks": 5,
+        "context_chunk_max_chars": 300,
     },
 }
 
@@ -308,19 +311,27 @@ def build_llm_client() -> Optional[object]:
 def llm_chat(messages: list, max_tokens: int = 900, temperature: float = 0.7) -> str:
     """
     Send a chat completion request to LM Studio.
-    Returns the assistant response text, or an error string.
+    Streams tokens to stdout as they arrive, then returns the full assembled string.
     """
     if not HAS_OPENAI or _llm_client is None:
         return "[LLM unavailable]"
     cfg = get_active_model_cfg()
     try:
-        resp = _llm_client.chat.completions.create(
+        stream = _llm_client.chat.completions.create(
             model=cfg["model"],
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            stream=True,
         )
-        return resp.choices[0].message.content.strip()
+        parts = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                print(delta, end="", flush=True)
+                parts.append(delta)
+        print()  # newline after stream ends
+        return "".join(parts)
     except Exception as e:
         return f"[LLM error: {e}]"
 
@@ -484,7 +495,7 @@ def episodic_retrieve(query: str) -> list:
     c = col(COL_EPISODIC)
     if c is None:
         return []
-    k = int(mcfg("episodic_top_k", 3))
+    k = int(mcfg("episodic_top_k", 2))
     try:
         results = c.query(query_texts=[query], n_results=k)
         docs = results.get("documents", [[]])[0]
@@ -615,6 +626,7 @@ def run_consolidation(client, model_cfg: dict, profile: dict) -> int:
     mem              = profile.get("memory", {})
     retention_days   = float(mem.get("episodic_retention_days", 7))
     max_tokens_sum   = int(mem.get("llm_max_tokens_summary", 200))
+    max_per_run      = int(mem.get("max_consolidate_per_run", 5))
     now              = _now_ts()
     cutoff           = now - (retention_days * 86400.0)
     consolidated     = 0
@@ -631,6 +643,8 @@ def run_consolidation(client, model_cfg: dict, profile: dict) -> int:
         to_delete = []
 
         for doc_id, doc, meta in zip(ids, docs, metas):
+            if consolidated >= max_per_run:
+                break
             ts_str = meta.get("timestamp", "")
             ts     = _ts_from_iso(ts_str)
             if ts > cutoff:
@@ -881,9 +895,11 @@ def build_context_block(query: str, mode: str = "auto") -> str:
     chunks = retrieve_semantic(query, mode)
     if not chunks:
         return ""
+    max_chunks = int(mcfg("context_max_chunks", 5))
+    chunk_chars = int(mcfg("context_chunk_max_chars", 300))
     lines = ["MEMORY CONTEXT:"]
-    for i, chunk in enumerate(chunks[:10], 1):
-        lines.append(f"[M-{i}] {chunk[:400]}")
+    for i, chunk in enumerate(chunks[:max_chunks], 1):
+        lines.append(f"[M-{i}] {chunk[:chunk_chars]}")
     return "\n".join(lines)
 
 
